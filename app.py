@@ -3,30 +3,39 @@ from kiteconnect import KiteConnect
 from datetime import datetime
 import threading
 import time
-import os   # ✅ NEW
+import os
 
 # ================= USER CONFIG =================
-EXPIRY = "26203"          # MANUAL
-STRIKE_RANGE = 500       # ATM ±500
+EXPIRY = "26203"          # MANUAL EXPIRY
+STRIKE_RANGE = 500        # ATM ±500
 STRIKE_STEP = 50
-FETCH_INTERVAL = 180     # 3 minutes
+FETCH_INTERVAL = 180      # 3 minutes
 # ==============================================
 
-# 🔐 READ FROM ENVIRONMENT VARIABLES (RENDER SAFE)
+# ================= ENV VARIABLES =================
 API_KEY = os.environ.get("KITE_API_KEY")
 ACCESS_TOKEN = os.environ.get("KITE_ACCESS_TOKEN")
 
 app = Flask(__name__)
 
-kite = KiteConnect(api_key=API_KEY)
-kite.set_access_token(ACCESS_TOKEN)
+kite = None
+symbols = {}              # {"25200CE": "NFO:NIFTY..."}
+oi_data = {}              # {"25200CE": [[time, oi], ...]}
+oi_thread_started = False
 
-symbols = {}     # { "25200CE": "NFO:NIFTY25JAN25200CE" }
-oi_data = {}     # { "25200CE": [[time, oi], ...] }
 
-# ================= STRIKE GENERATION =================
+# ================= INIT FUNCTIONS =================
+def init_kite():
+    global kite
+    if kite is None:
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(ACCESS_TOKEN)
+        print("[INIT] Kite connected")
+
+
 def generate_symbols():
     global symbols
+    symbols.clear()
 
     ltp = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
     atm = round(ltp / 50) * 50
@@ -41,9 +50,9 @@ def generate_symbols():
         symbols[f"{strike}CE"] = f"NFO:NIFTY{EXPIRY}{strike}CE"
         symbols[f"{strike}PE"] = f"NFO:NIFTY{EXPIRY}{strike}PE"
 
-    print(f"Generated {len(symbols)} NIFTY option symbols")
+    print(f"[INIT] Generated {len(symbols)} strikes")
 
-# ================= OI FETCH LOOP =================
+
 def fetch_oi():
     while True:
         try:
@@ -52,32 +61,49 @@ def fetch_oi():
 
             for key, symbol in symbols.items():
                 oi = quotes[symbol]["oi"]
+                oi_data.setdefault(key, []).append([now, oi])
 
-                if key not in oi_data:
-                    oi_data[key] = []
-
-                oi_data[key].append([now, oi])
-
-            print(f"OI updated @ {now}")
+            print(f"[OI] Updated @ {now}")
 
         except Exception as e:
-            print("OI fetch error:", e)
+            print("[ERROR] OI fetch:", e)
 
         time.sleep(FETCH_INTERVAL)
+
+
+def init_if_needed():
+    global oi_thread_started
+
+    if not symbols:
+        init_kite()
+        generate_symbols()
+
+    if not oi_thread_started:
+        threading.Thread(target=fetch_oi, daemon=True).start()
+        oi_thread_started = True
+        print("[INIT] OI thread started")
+
 
 # ================= FLASK ROUTES =================
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
 
+
 @app.route("/strikes")
 def strikes():
-    return jsonify(sorted(symbols.keys()))
+    try:
+        init_if_needed()
+        return jsonify(sorted(symbols.keys()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/get_multi_oi", methods=["POST"])
 def get_multi_oi():
-    selected = request.json
+    selected = request.json or []
     return jsonify({s: oi_data.get(s, []) for s in selected})
+
 
 # ================= HTML + JS =================
 HTML_PAGE = """
@@ -92,6 +118,8 @@ HTML_PAGE = """
 
 <h2>NIFTY Option OI — ATM ±500</h2>
 
+<div id="status" style="color:red;margin-bottom:10px"></div>
+
 <select id="strikes" multiple size="15" style="width:220px"></select>
 <br><br>
 <button onclick="loadOI()">Plot Selected Strikes</button>
@@ -103,10 +131,13 @@ let chart;
 let selectedStrikes = [];
 const ctx = document.getElementById("oiChart").getContext("2d");
 
-// Load strikes
 fetch("/strikes")
 .then(res => res.json())
 .then(data => {
+    if (data.error) {
+        document.getElementById("status").innerText = data.error;
+        return;
+    }
     const sel = document.getElementById("strikes");
     data.forEach(s => {
         const opt = document.createElement("option");
@@ -139,7 +170,7 @@ function updateChart() {
     .then(res => res.json())
     .then(data => {
 
-        const labels = data[selectedStrikes[0]].map(x => x[0]);
+        const labels = data[selectedStrikes[0]]?.map(x => x[0]) || [];
         const datasets = [];
 
         Object.keys(data).forEach(strike => {
@@ -159,9 +190,7 @@ function updateChart() {
                 responsive: true,
                 animation: false,
                 interaction: { mode: "index", intersect: false },
-                plugins: {
-                    legend: { position: "top" }
-                }
+                plugins: { legend: { position: "top" } }
             }
         });
     });
@@ -176,6 +205,4 @@ setInterval(updateChart, 180000);
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    generate_symbols()
-    threading.Thread(target=fetch_oi, daemon=True).start()
-    app.run(debug=False)
+    app.run()
